@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Literal, Optional
 
 import requests
@@ -35,13 +36,19 @@ class HeadlineSentiment(BaseModel):
     brief_reason: str
  
  
+class HeadlineSentimentBatch(BaseModel):
+    """Wrapper schema for classifying every headline in a single LLM call."""
+    items: list[HeadlineSentiment]
+ 
+ 
 class TradeSignal(BaseModel):
     signal: Literal["Buy", "Hold", "Sell"]
     justification: str
     key_factors: list[str]
-
+ 
  
 # LLM client wrapper
+
 class GroqClient:
     def __init__(self, api_key: Optional[str] = None, model: str = config.OPENROUTER_MODEL):
         api_key = api_key or config.OPENROUTER_API_KEY
@@ -52,20 +59,20 @@ class GroqClient:
             )
         self._api_key = api_key
         self._model = model
+        self._last_call_ts: float = 0.0
+ 
+    def _throttle(self) -> None:
+        """Enforce a minimum gap between outgoing requests so we don't fire
+        calls back-to-back into a free-tier per-minute rate limit."""
+        elapsed = time.monotonic() - self._last_call_ts
+        wait = config.LLM_MIN_SECONDS_BETWEEN_CALLS - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call_ts = time.monotonic()
  
     def complete_json(self, system_prompt: str, user_prompt: str) -> dict:
         """Call the model and parse its output as JSON. Raises on hard failure."""
-        try:
-            payload = self._post(system_prompt, user_prompt, force_json_mode=True)
-        except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 400:
-                logger.warning(
-                    "response_format=json_object rejected (HTTP 400), retrying "
-                    "without it: %s", exc.response.text[:300]
-                )
-                payload = self._post(system_prompt, user_prompt, force_json_mode=False)
-            else:
-                raise
+        payload = self._post_with_429_backoff(system_prompt, user_prompt, force_json_mode=True)
  
         if "error" in payload:
             raise RuntimeError(f"OpenRouter error: {payload['error']}")
@@ -90,6 +97,43 @@ class GroqClient:
             )
  
         return self._parse_json(raw)
+ 
+    def _post_with_429_backoff(
+        self, system_prompt: str, user_prompt: str, force_json_mode: bool
+    ) -> dict:
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, config.LLM_429_MAX_RETRIES + 1):
+            self._throttle()
+            try:
+                return self._post(system_prompt, user_prompt, force_json_mode)
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status == 400 and force_json_mode:
+                    logger.warning(
+                        "response_format=json_object rejected (HTTP 400), retrying "
+                        "without it: %s", exc.response.text[:300]
+                    )
+                    force_json_mode = False
+                    continue
+                if status == 429:
+                    last_exc = exc
+                    retry_after = None
+                    if exc.response is not None:
+                        retry_after = exc.response.headers.get("Retry-After")
+                    if retry_after:
+                        wait = float(retry_after)
+                    else:
+                        wait = config.LLM_429_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+                    logger.warning(
+                        "429 rate limited (attempt %d/%d). Waiting %.1fs before retrying...",
+                        attempt, config.LLM_429_MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError(
+            f"Still rate limited after {config.LLM_429_MAX_RETRIES} attempts: {last_exc}"
+        )
  
     def _post(self, system_prompt: str, user_prompt: str, force_json_mode: bool) -> dict:
         body = {
@@ -148,7 +192,7 @@ def _call_with_validation(
                 f"Your previous response was invalid: {exc}. "
                 f"Return ONLY valid JSON matching the required schema."
             )
-        except Exception as exc:
+        except Exception as exc:  # network / API errors
             last_error = exc
             logger.error("LLM call failed (attempt %d): %s", attempt, exc)
  
@@ -159,33 +203,57 @@ def _call_with_validation(
  
  
 # Public functions
+ 
 def classify_headline(client: GroqClient, ticker: str, headline: str) -> Optional[HeadlineSentiment]:
-    """Classify a single headline's sentiment. Returns None on unrecoverable failure
-    (logged, not raised) so one bad headline doesn't abort the whole batch."""
     user_prompt = config.SENTIMENT_USER_PROMPT_TEMPLATE.format(ticker=ticker, headline=headline)
     try:
         result = _call_with_validation(
             client, config.SENTIMENT_SYSTEM_PROMPT, user_prompt, HeadlineSentiment
         )
-        return result
+        return result  # type: ignore[return-value]
     except LLMResponseError as exc:
         logger.error("Skipping headline due to persistent LLM failure: %s | %s", headline, exc)
+        return None
+ 
+ 
+def classify_headlines_batch(
+    client: GroqClient, ticker: str, headlines: list[NewsHeadline]
+) -> Optional[list[HeadlineSentiment]]:
+    if not headlines:
+        return []
+ 
+    numbered = "\n".join(f"{i+1}. {h.title}" for i, h in enumerate(headlines))
+    user_prompt = config.BATCH_SENTIMENT_USER_PROMPT_TEMPLATE.format(
+        ticker=ticker, numbered_headlines=numbered, n_headlines=len(headlines)
+    )
+    try:
+        result = _call_with_validation(
+            client, config.BATCH_SENTIMENT_SYSTEM_PROMPT, user_prompt, HeadlineSentimentBatch
+        )
+        items = result.items  # type: ignore[attr-defined]
+        if len(items) != len(headlines):
+            logger.warning(
+                "Batch returned %d items for %d headlines -- using what came back.",
+                len(items), len(headlines),
+            )
+        return items
+    except LLMResponseError as exc:
+        logger.warning("Batch headline classification failed, will fall back to per-headline: %s", exc)
         return None
  
  
 def analyze_headlines(
     client: GroqClient, ticker: str, headlines: list[NewsHeadline]
 ) -> tuple[list[HeadlineSentiment], float]:
-    """
-    Classify every headline and compute an aggregate sentiment score in
-    [-1.0, 1.0]: confidence-weighted average of (+1 positive, -1 negative,
-    0 neutral).
-    """
-    results: list[HeadlineSentiment] = []
-    for h in headlines:
-        classified = classify_headline(client, ticker, h.title)
-        if classified is not None:
-            results.append(classified)
+    results = classify_headlines_batch(client, ticker, headlines)
+ 
+    if results is None:
+        logger.info("Falling back to per-headline classification (%d calls)...", len(headlines))
+        results = []
+        for h in headlines:
+            classified = classify_headline(client, ticker, h.title)
+            if classified is not None:
+                results.append(classified)
  
     if not results:
         return results, 0.0

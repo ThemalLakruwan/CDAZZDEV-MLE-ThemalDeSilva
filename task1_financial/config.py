@@ -28,7 +28,9 @@ OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 LLM_TIMEOUT_SECONDS = 30
 LLM_MAX_RETRIES = 2
 LLM_MAX_TOKENS = 600
-
+LLM_MIN_SECONDS_BETWEEN_CALLS = 4.0  
+LLM_429_MAX_RETRIES = 5               
+LLM_429_BACKOFF_BASE_SECONDS = 5.0 
 
 # Prompt templates
 SENTIMENT_SYSTEM_PROMPT = """You are a disciplined financial news analyst.
@@ -51,6 +53,36 @@ SENTIMENT_USER_PROMPT_TEMPLATE = """Ticker: {ticker}
 Headline: "{headline}"
 
 Classify this headline's sentiment for {ticker} stock."""
+
+BATCH_SENTIMENT_SYSTEM_PROMPT = """You are a disciplined financial news analyst.
+You will be given a numbered list of news headlines about a public company.
+Classify the sentiment of EACH headline toward the company's stock. Be
+conservative: only mark something positive or negative if the headline
+gives a clear, specific reason. Ambiguous or purely factual headlines are
+neutral.
+ 
+Respond with ONLY a JSON object matching exactly this schema, no prose,
+no markdown fences. The "items" array MUST contain exactly one entry per
+headline, in the same order they were given:
+{
+  "items": [
+    {
+      "headline": "<the exact headline text>",
+      "sentiment": "positive" | "negative" | "neutral",
+      "confidence": <float between 0.0 and 1.0>,
+      "brief_reason": "<one short sentence, max 25 words>"
+    }
+  ]
+}
+"""
+
+BATCH_SENTIMENT_USER_PROMPT_TEMPLATE = """Ticker: {ticker}
+ 
+Headlines:
+{numbered_headlines}
+ 
+Classify each headline's sentiment for {ticker} stock. Return exactly
+{n_headlines} items in the same order as given above."""
 
 SIGNAL_SYSTEM_PROMPT = """You are a senior equity research analyst producing
 a first-pass technical read on a stock. You will be given a set of computed
