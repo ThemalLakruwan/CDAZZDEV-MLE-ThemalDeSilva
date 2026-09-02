@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Literal, Optional
 
-from openai import OpenAI  # Groq exposes an OpenAI-compatible API
+import requests
 from pydantic import BaseModel, Field, ValidationError
 
 import config
@@ -42,32 +43,55 @@ class TradeSignal(BaseModel):
 
 # LLM client wrapper
 class GroqClient:
-    def __init__(self, api_key: Optional[str] = None, model: str = config.GROQ_MODEL):
-        api_key = api_key or config.GROQ_API_KEY
+    def __init__(self, api_key: Optional[str] = None, model: str = config.OPENROUTER_MODEL):
+        api_key = api_key or config.OPENROUTER_API_KEY
         if not api_key:
             raise RuntimeError(
-                "GROQ_API_KEY is not set. In Colab: os.environ['GROQ_API_KEY'] = "
-                "userdata.get('GROQ_API_KEY')."
+                "OPENROUTER_API_KEY is not set. In Colab: os.environ['OPENROUTER_API_KEY'] = "
+                "userdata.get('OPENROUTER_API_KEY')  (using Colab Secrets, never hardcode it)."
             )
-        self._client = OpenAI(api_key=api_key, base_url=config.GROQ_BASE_URL)
+        self._api_key = api_key
         self._model = model
-
+ 
     def complete_json(self, system_prompt: str, user_prompt: str) -> dict:
         """Call the model and parse its output as JSON. Raises on hard failure."""
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
+        response = requests.post(
+            url=config.OPENROUTER_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(
+                {
+                    "model": self._model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.2,
+                }
+            ),
             timeout=config.LLM_TIMEOUT_SECONDS,
-            response_format={"type": "json_object"},
         )
-        raw = response.choices[0].message.content
-        return json.loads(raw)
-
-
+        response.raise_for_status()
+        payload = response.json()
+ 
+        if "error" in payload:
+            raise RuntimeError(f"OpenRouter error: {payload['error']}")
+ 
+        raw = payload["choices"][0]["message"]["content"]
+        return self._parse_json(raw)
+ 
+    @staticmethod
+    def _parse_json(raw: str) -> dict:
+        text = raw.strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            text = match.group(0)
+        return json.loads(text)
+ 
+ 
 def _call_with_validation(
     client: GroqClient,
     system_prompt: str,
@@ -76,7 +100,7 @@ def _call_with_validation(
 ) -> BaseModel:
     last_error: Optional[Exception] = None
     prompt = user_prompt
-
+ 
     for attempt in range(1, config.LLM_MAX_RETRIES + 1):
         try:
             raw_json = client.complete_json(system_prompt, prompt)
@@ -92,7 +116,7 @@ def _call_with_validation(
         except Exception as exc:  # network / API errors
             last_error = exc
             logger.error("LLM call failed (attempt %d): %s", attempt, exc)
-
+ 
     raise LLMResponseError(
         f"LLM failed to produce a valid {schema.__name__} after "
         f"{config.LLM_MAX_RETRIES} attempts: {last_error}"
@@ -112,8 +136,8 @@ def classify_headline(client: GroqClient, ticker: str, headline: str) -> Optiona
     except LLMResponseError as exc:
         logger.error("Skipping headline due to persistent LLM failure: %s | %s", headline, exc)
         return None
-
-
+ 
+ 
 def analyze_headlines(
     client: GroqClient, ticker: str, headlines: list[NewsHeadline]
 ) -> tuple[list[HeadlineSentiment], float]:
@@ -127,18 +151,18 @@ def analyze_headlines(
         classified = classify_headline(client, ticker, h.title)
         if classified is not None:
             results.append(classified)
-
+ 
     if not results:
         return results, 0.0
-
+ 
     polarity = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
     weighted_sum = sum(polarity[r.sentiment] * r.confidence for r in results)
     weight_total = sum(r.confidence for r in results) or 1.0
     aggregate_score = round(weighted_sum / weight_total, 3)
-
+ 
     return results, aggregate_score
-
-
+ 
+ 
 def generate_trade_signal(
     client: GroqClient,
     ticker: str,

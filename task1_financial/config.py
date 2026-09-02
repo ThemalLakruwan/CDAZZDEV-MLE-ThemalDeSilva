@@ -22,9 +22,9 @@ BOLLINGER_WINDOW = 20
 BOLLINGER_STD = 2
 
 # LLM settings
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 LLM_TIMEOUT_SECONDS = 30
 LLM_MAX_RETRIES = 2
 
