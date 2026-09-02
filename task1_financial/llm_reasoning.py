@@ -33,14 +33,14 @@ class HeadlineSentiment(BaseModel):
     sentiment: Literal["positive", "negative", "neutral"]
     confidence: float = Field(ge=0.0, le=1.0)
     brief_reason: str
-
-
+ 
+ 
 class TradeSignal(BaseModel):
     signal: Literal["Buy", "Hold", "Sell"]
     justification: str
     key_factors: list[str]
 
-
+ 
 # LLM client wrapper
 class GroqClient:
     def __init__(self, api_key: Optional[str] = None, model: str = config.OPENROUTER_MODEL):
@@ -55,32 +55,67 @@ class GroqClient:
  
     def complete_json(self, system_prompt: str, user_prompt: str) -> dict:
         """Call the model and parse its output as JSON. Raises on hard failure."""
+        try:
+            payload = self._post(system_prompt, user_prompt, force_json_mode=True)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 400:
+                logger.warning(
+                    "response_format=json_object rejected (HTTP 400), retrying "
+                    "without it: %s", exc.response.text[:300]
+                )
+                payload = self._post(system_prompt, user_prompt, force_json_mode=False)
+            else:
+                raise
+ 
+        if "error" in payload:
+            raise RuntimeError(f"OpenRouter error: {payload['error']}")
+ 
+        choices = payload.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"OpenRouter returned no choices. Full payload: {payload}")
+ 
+        message = choices[0]["message"]
+        raw = message.get("content")
+ 
+        if not raw:
+            finish_reason = choices[0].get("finish_reason")
+            reasoning_preview = (message.get("reasoning") or "")[:200]
+            raise RuntimeError(
+                "OpenRouter returned an empty message content. "
+                f"finish_reason={finish_reason!r}, "
+                f"reasoning_preview={reasoning_preview!r}. "
+                "Likely causes: token budget too low, or the model requires "
+                "reasoning tokens it wasn't given room for. Try raising "
+                "config.LLM_MAX_TOKENS or switching config.OPENROUTER_MODEL."
+            )
+ 
+        return self._parse_json(raw)
+ 
+    def _post(self, system_prompt: str, user_prompt: str, force_json_mode: bool) -> dict:
+        body = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": config.LLM_MAX_TOKENS,
+            "reasoning": {"enabled": False},
+        }
+        if force_json_mode:
+            body["response_format"] = {"type": "json_object"}
+ 
         response = requests.post(
             url=config.OPENROUTER_BASE_URL,
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
-            data=json.dumps(
-                {
-                    "model": self._model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                }
-            ),
+            data=json.dumps(body),
             timeout=config.LLM_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        payload = response.json()
- 
-        if "error" in payload:
-            raise RuntimeError(f"OpenRouter error: {payload['error']}")
- 
-        raw = payload["choices"][0]["message"]["content"]
-        return self._parse_json(raw)
+        return response.json()
  
     @staticmethod
     def _parse_json(raw: str) -> dict:
@@ -113,7 +148,7 @@ def _call_with_validation(
                 f"Your previous response was invalid: {exc}. "
                 f"Return ONLY valid JSON matching the required schema."
             )
-        except Exception as exc:  # network / API errors
+        except Exception as exc:
             last_error = exc
             logger.error("LLM call failed (attempt %d): %s", attempt, exc)
  
@@ -121,8 +156,8 @@ def _call_with_validation(
         f"LLM failed to produce a valid {schema.__name__} after "
         f"{config.LLM_MAX_RETRIES} attempts: {last_error}"
     )
-
-
+ 
+ 
 # Public functions
 def classify_headline(client: GroqClient, ticker: str, headline: str) -> Optional[HeadlineSentiment]:
     """Classify a single headline's sentiment. Returns None on unrecoverable failure
@@ -132,7 +167,7 @@ def classify_headline(client: GroqClient, ticker: str, headline: str) -> Optiona
         result = _call_with_validation(
             client, config.SENTIMENT_SYSTEM_PROMPT, user_prompt, HeadlineSentiment
         )
-        return result  # type: ignore[return-value]
+        return result
     except LLMResponseError as exc:
         logger.error("Skipping headline due to persistent LLM failure: %s | %s", headline, exc)
         return None
