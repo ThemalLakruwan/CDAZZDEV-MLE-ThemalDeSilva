@@ -9,4 +9,7 @@ task1_financial/
 ├── requirements.txt
 └── README.md               # this file
 ```
+Colab Notebook: https://colab.research.google.com/drive/1MwYDCx9hTTBo_UuQUFoh41Ky6rpR1O-u?usp=sharing
+
+Video Link: https://youtu.be/VTZ-qrHHD2o
 
