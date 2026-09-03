@@ -47,9 +47,11 @@ class TradeSignal(BaseModel):
     key_factors: list[str]
  
  
-# LLM client wrapper
 
+# LLM client wrapper
+ 
 class GroqClient:
+
     def __init__(self, api_key: Optional[str] = None, model: str = config.OPENROUTER_MODEL):
         api_key = api_key or config.OPENROUTER_API_KEY
         if not api_key:
@@ -62,8 +64,6 @@ class GroqClient:
         self._last_call_ts: float = 0.0
  
     def _throttle(self) -> None:
-        """Enforce a minimum gap between outgoing requests so we don't fire
-        calls back-to-back into a free-tier per-minute rate limit."""
         elapsed = time.monotonic() - self._last_call_ts
         wait = config.LLM_MIN_SECONDS_BETWEEN_CALLS - elapsed
         if wait > 0:
@@ -84,12 +84,12 @@ class GroqClient:
         message = choices[0]["message"]
         raw = message.get("content")
  
-        if not raw:
+        if not raw or not raw.strip():
             finish_reason = choices[0].get("finish_reason")
             reasoning_preview = (message.get("reasoning") or "")[:200]
             raise RuntimeError(
-                "OpenRouter returned an empty message content. "
-                f"finish_reason={finish_reason!r}, "
+                "OpenRouter returned an empty (or whitespace-only) message "
+                f"content. finish_reason={finish_reason!r}, "
                 f"reasoning_preview={reasoning_preview!r}. "
                 "Likely causes: token budget too low, or the model requires "
                 "reasoning tokens it wasn't given room for. Try raising "
@@ -97,7 +97,12 @@ class GroqClient:
             )
  
         return self._parse_json(raw)
- 
+    
+    """ASSISTED: Claude (claude-sonnet-4-6),
+ Prompt: 'Fix the groq client to handle openrouter rate limits and add batching for headline classification.
+ Implement a retry strategy with exponential backoff for 429 errors, and ensure the client can parse JSON output from the LLM, even if wrapped in markdown fences or with stray text.',
+ Date: 2026-09-03"""
+
     def _post_with_429_backoff(
         self, system_prompt: str, user_prompt: str, force_json_mode: bool
     ) -> dict:
@@ -116,6 +121,26 @@ class GroqClient:
                     force_json_mode = False
                     continue
                 if status == 429:
+                    body_text = exc.response.text if exc.response is not None else ""
+                    # OpenRouter free models enforce TWO separate 429 causes:
+                    # (a) 20 requests/minute -- transient, worth waiting for.
+                    # (b) 50 requests/day (or 1000/day with $10+ lifetime
+                    #     credits purchased) -- a hard daily quota that does
+                    #     NOT refill by waiting seconds or minutes; it only
+                    #     resets at day rollover (UTC), or by adding credits.
+                    # We check the error body for daily-cap language and, if
+                    # found, stop retrying immediately rather than burning
+                    # 5 rounds of exponential backoff (~150s+) for nothing.
+                    if re.search(r"\bday\b|\bdaily\b", body_text, flags=re.IGNORECASE):
+                        raise RuntimeError(
+                            "Hit OpenRouter's DAILY free-model quota (50 requests/day "
+                            "without purchased credits, 1000/day with $10+ lifetime "
+                            "credits). This will NOT be fixed by waiting seconds or "
+                            "minutes -- it resets at UTC midnight, or you can add "
+                            "credits at https://openrouter.ai/credits. "
+                            f"Server said: {body_text[:300]}"
+                        ) from exc
+ 
                     last_exc = exc
                     retry_after = None
                     if exc.response is not None:
@@ -125,7 +150,8 @@ class GroqClient:
                     else:
                         wait = config.LLM_429_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
                     logger.warning(
-                        "429 rate limited (attempt %d/%d). Waiting %.1fs before retrying...",
+                        "429 rate limited (attempt %d/%d, likely per-minute cap). "
+                        "Waiting %.1fs before retrying...",
                         attempt, config.LLM_429_MAX_RETRIES, wait,
                     )
                     time.sleep(wait)
@@ -144,6 +170,11 @@ class GroqClient:
             ],
             "temperature": 0.2,
             "max_tokens": config.LLM_MAX_TOKENS,
+            # Gemma-4 is a "thinking" model with reasoning mode ON by
+            # default on OpenRouter. Left enabled, it can spend the entire
+            # token budget on hidden reasoning tokens and return an EMPTY
+            # final `content` -- which is what was producing "Expecting
+            # value: line 1 column 1 (char 0)" (i.e. json.loads("")).
             "reasoning": {"enabled": False},
         }
         if force_json_mode:
@@ -201,7 +232,7 @@ def _call_with_validation(
         f"{config.LLM_MAX_RETRIES} attempts: {last_error}"
     )
  
- 
+
 # Public functions
  
 def classify_headline(client: GroqClient, ticker: str, headline: str) -> Optional[HeadlineSentiment]:
