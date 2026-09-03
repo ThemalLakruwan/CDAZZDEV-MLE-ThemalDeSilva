@@ -24,7 +24,7 @@ BOLLINGER_STD = 2
 # LLM settings
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+OPENROUTER_MODEL = "nvidia/nemotron-3.5-lightning:free"
 LLM_TIMEOUT_SECONDS = 30
 LLM_MAX_RETRIES = 2
 LLM_MAX_TOKENS = 600
