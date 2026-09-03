@@ -46,12 +46,10 @@ class TradeSignal(BaseModel):
     justification: str
     key_factors: list[str]
  
- 
 
 # LLM client wrapper
  
 class GroqClient:
-
     def __init__(self, api_key: Optional[str] = None, model: str = config.OPENROUTER_MODEL):
         api_key = api_key or config.OPENROUTER_API_KEY
         if not api_key:
@@ -70,9 +68,10 @@ class GroqClient:
             time.sleep(wait)
         self._last_call_ts = time.monotonic()
  
-    def complete_json(self, system_prompt: str, user_prompt: str) -> dict:
-        """Call the model and parse its output as JSON. Raises on hard failure."""
-        payload = self._post_with_429_backoff(system_prompt, user_prompt, force_json_mode=True)
+    def complete_json(self, system_prompt: str, user_prompt: str, max_tokens: Optional[int] = None) -> dict:
+        payload = self._post_with_429_backoff(
+            system_prompt, user_prompt, force_json_mode=True, max_tokens=max_tokens
+        )
  
         if "error" in payload:
             raise RuntimeError(f"OpenRouter error: {payload['error']}")
@@ -97,20 +96,23 @@ class GroqClient:
             )
  
         return self._parse_json(raw)
-    
     """ASSISTED: Claude (claude-sonnet-4-6),
  Prompt: 'Fix the groq client to handle openrouter rate limits and add batching for headline classification.
  Implement a retry strategy with exponential backoff for 429 errors, and ensure the client can parse JSON output from the LLM, even if wrapped in markdown fences or with stray text.',
  Date: 2026-09-03"""
-
+ 
     def _post_with_429_backoff(
-        self, system_prompt: str, user_prompt: str, force_json_mode: bool
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        force_json_mode: bool,
+        max_tokens: Optional[int] = None,
     ) -> dict:
         last_exc: Optional[Exception] = None
         for attempt in range(1, config.LLM_429_MAX_RETRIES + 1):
             self._throttle()
             try:
-                return self._post(system_prompt, user_prompt, force_json_mode)
+                return self._post(system_prompt, user_prompt, force_json_mode, max_tokens)
             except requests.exceptions.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else None
                 if status == 400 and force_json_mode:
@@ -161,7 +163,13 @@ class GroqClient:
             f"Still rate limited after {config.LLM_429_MAX_RETRIES} attempts: {last_exc}"
         )
  
-    def _post(self, system_prompt: str, user_prompt: str, force_json_mode: bool) -> dict:
+    def _post(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        force_json_mode: bool,
+        max_tokens: Optional[int] = None,
+    ) -> dict:
         body = {
             "model": self._model,
             "messages": [
@@ -169,12 +177,7 @@ class GroqClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": config.LLM_MAX_TOKENS,
-            # Gemma-4 is a "thinking" model with reasoning mode ON by
-            # default on OpenRouter. Left enabled, it can spend the entire
-            # token budget on hidden reasoning tokens and return an EMPTY
-            # final `content` -- which is what was producing "Expecting
-            # value: line 1 column 1 (char 0)" (i.e. json.loads("")).
+            "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
             "reasoning": {"enabled": False},
         }
         if force_json_mode:
@@ -207,13 +210,14 @@ def _call_with_validation(
     system_prompt: str,
     user_prompt: str,
     schema: type[BaseModel],
+    max_tokens: Optional[int] = None,
 ) -> BaseModel:
     last_error: Optional[Exception] = None
     prompt = user_prompt
  
     for attempt in range(1, config.LLM_MAX_RETRIES + 1):
         try:
-            raw_json = client.complete_json(system_prompt, prompt)
+            raw_json = client.complete_json(system_prompt, prompt, max_tokens=max_tokens)
             return schema.model_validate(raw_json)
         except (ValidationError, json.JSONDecodeError) as exc:
             last_error = exc
@@ -232,7 +236,7 @@ def _call_with_validation(
         f"{config.LLM_MAX_RETRIES} attempts: {last_error}"
     )
  
-
+ 
 # Public functions
  
 def classify_headline(client: GroqClient, ticker: str, headline: str) -> Optional[HeadlineSentiment]:
@@ -257,9 +261,22 @@ def classify_headlines_batch(
     user_prompt = config.BATCH_SENTIMENT_USER_PROMPT_TEMPLATE.format(
         ticker=ticker, numbered_headlines=numbered, n_headlines=len(headlines)
     )
+    # Scale the token budget to the number of headlines -- a fixed budget
+    # sized for one item (config.LLM_MAX_TOKENS=600) truncates mid-JSON
+    # once you're generating structured output for 8-10+ headlines at
+    # once, which produces invalid JSON that looks like a formatting bug
+    # but is really "the model ran out of room to finish."
+    batch_max_tokens = min(
+        config.LLM_BATCH_TOKENS_BASE + config.LLM_BATCH_TOKENS_PER_ITEM * len(headlines),
+        config.LLM_BATCH_MAX_TOKENS_CAP,
+    )
     try:
         result = _call_with_validation(
-            client, config.BATCH_SENTIMENT_SYSTEM_PROMPT, user_prompt, HeadlineSentimentBatch
+            client,
+            config.BATCH_SENTIMENT_SYSTEM_PROMPT,
+            user_prompt,
+            HeadlineSentimentBatch,
+            max_tokens=batch_max_tokens,
         )
         items = result.items  # type: ignore[attr-defined]
         if len(items) != len(headlines):
@@ -304,7 +321,6 @@ def generate_trade_signal(
     sentiment_score: float,
     n_headlines: int,
 ) -> Optional[TradeSignal]:
-    """Produce the Buy/Hold/Sell signal reasoned over the indicator combination."""
     ind = summary["indicators"]
     user_prompt = config.SIGNAL_USER_PROMPT_TEMPLATE.format(
         ticker=ticker,
